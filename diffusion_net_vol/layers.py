@@ -23,7 +23,7 @@ class LearnedTimeDiffusion(nn.Module):
 
         nn.init.constant_(self.diffusion_time, 0.0)
 
-    def forward(self, x, evals, evecs):
+    def forward(self, x, mass, evals, evecs):
 
         # project times to the positive halfspace
         # (and away from 0 in the incredibly rare chance that they get stuck)
@@ -157,7 +157,7 @@ class DiffusionNetBlock(nn.Module):
             [self.MLP_C] + self.mlp_hidden_dims + [self.C_width], dropout=self.dropout
         )
 
-    def forward(self, x_in, evals, evecs, gradX, gradY, gradZ):
+    def forward(self, x_in, mass, evals, evecs, gradX, gradY, gradZ):
 
         # Manage dimensions
         B = x_in.shape[0]  # batch dimension
@@ -169,7 +169,7 @@ class DiffusionNetBlock(nn.Module):
             )
 
         # Diffusion block
-        x_diffuse = self.diffusion(x_in, evals, evecs)
+        x_diffuse = self.diffusion(x_in, mass, evals, evecs)
 
         # Compute gradient features, if using
         if self.with_gradient_features:
@@ -286,6 +286,7 @@ class DiffusionNet(nn.Module):
     def forward(
         self,
         x_in,
+        mass, 
         evals=None,
         evecs=None,
         gradX=None,
@@ -327,7 +328,8 @@ class DiffusionNet(nn.Module):
 
             # add a batch dim to all inputs
             x_in = x_in.unsqueeze(0)
-           
+            mass = mass.unsqueeze(0)
+            
             if evals is not None:
                 evals = evals.unsqueeze(0)
             if evecs is not None:
@@ -354,7 +356,7 @@ class DiffusionNet(nn.Module):
 
         # Apply each of the blocks
         for b in self.blocks:
-            x = b(x, evals, evecs, gradX, gradY, gradZ)
+            x = b(x, mass, evals, evecs, gradX, gradY, gradZ)
 
         # Apply the last linear layer
         x = self.last_lin(x)
