@@ -5,7 +5,7 @@ import torch.nn as nn
 from utils import get_mask, FrobeniusLoss
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../"))  # add the path to the DiffusionNet src
-from diffusion_net.layers import DiffusionNet  # noqa
+from diffusion_net_vol.layers import DiffusionNet  # noqa
 
 
 class RegularizedFMNet(nn.Module):
@@ -70,22 +70,21 @@ class GeomFMapNet(nn.Module):
         self.n_fmap = cfg["fmap"]["n_fmap"]
 
     def forward(self, batch):
-        verts1, faces1, mass1, L1, evals1, evecs1, gradX1, gradY1 = (batch["shape1"]["xyz"], batch["shape1"]["faces"],
-                                                                     batch["shape1"]["mass"], batch["shape1"]["L"],
-                                                                     batch["shape1"]["evals"], batch["shape1"]["evecs"],
-                                                                     batch["shape1"]["gradX"], batch["shape1"]["gradY"])
-        verts2, faces2, mass2, L2, evals2, evecs2, gradX2, gradY2 = (batch["shape2"]["xyz"], batch["shape2"]["faces"],
-                                                                     batch["shape2"]["mass"], batch["shape2"]["L"],
+        verts1, tets1, mass1, evals1, evecs1, gradX1, gradY1, gradZ1 = (batch["shape1"]["xyz"], batch["shape1"]["tets"],
+                                                                     batch["shape1"]["mass"], batch["shape1"]["evals"], batch["shape1"]["evecs"],
+                                                                     batch["shape1"]["gradX"], batch["shape1"]["gradY"],batch["shape1"]["gradZ"])
+        verts2, tets2, mass2, evals2, evecs2, gradX2, gradY2, gradZ2 = (batch["shape2"]["xyz"], batch["shape2"]["tets"],
+                                                                     batch["shape2"]["mass"],
                                                                      batch["shape2"]["evals"], batch["shape2"]["evecs"],
-                                                                     batch["shape2"]["gradX"], batch["shape2"]["gradY"])
+                                                                     batch["shape2"]["gradX"], batch["shape2"]["gradY"], batch["shape2"]["gradZ"])
 
         # set features to vertices
         features1, features2 = verts1, verts2
 
-        feat1 = self.feature_extractor(features1, mass1, L=L1, evals=evals1, evecs=evecs1,
-                                       gradX=gradX1, gradY=gradY1, faces=faces1).unsqueeze(0)
-        feat2 = self.feature_extractor(features2, mass2, L=L2, evals=evals2, evecs=evecs2,
-                                       gradX=gradX2, gradY=gradY2, faces=faces2).unsqueeze(0)
+        feat1 = self.feature_extractor(features1, mass1, evals=evals1, evecs=evecs1,
+                                       gradX=gradX1, gradY=gradY1, gradZ=gradZ1, faces=tets1).unsqueeze(0)
+        feat2 = self.feature_extractor(features2, mass2, evals=evals2, evecs=evecs2,
+                                       gradX=gradX2, gradY=gradY2, gradZ=gradZ2, faces=tets2).unsqueeze(0)
 
         # predict fmap
         evecs_trans1, evecs_trans2 = evecs1.t()[:self.n_fmap] @ torch.diag(mass1), evecs2.t()[:self.n_fmap] @ torch.diag(mass2)

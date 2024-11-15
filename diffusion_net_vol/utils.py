@@ -154,7 +154,6 @@ def read_carp_bin_mesh(basename):
         byte_order = '<' if endianness == 0 else '>'
         # Read the rest of the file
         data = file.read()
-        print(len(data))
         # Assuming the data after the header is a series of integers
         # Adjust the format string if it's a different data type
         format_string = f"{byte_order}{6*numele}i"
@@ -164,6 +163,7 @@ def read_carp_bin_mesh(basename):
 
     temp = np.array(unpacked_data).reshape(numele, -1)
     con = temp[:,1:5]
+    con = con[:, [1,0,2,3]]
     tags = temp[:,-1]
 
     # finally the lon file

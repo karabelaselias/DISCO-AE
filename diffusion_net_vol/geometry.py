@@ -2,6 +2,7 @@ import os.path
 import random
 import scipy.sparse as sparse
 import scipy.sparse.linalg as sla
+from itertools import combinations
 import pyamg
 
 # ^^^ we NEED to import scipy before torch, or it crashes :(
@@ -14,6 +15,9 @@ import sklearn.neighbors
 
 from .utils import toNP, sparse_np_to_torch, ensure_dir_exists, hash_arrays, sparse_torch_to_np, PINVIT
 
+from typing import List, Tuple, Optional
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 def norm(x, highdim=False):
     """
@@ -444,133 +448,206 @@ def massmatrix(V, F, type='barycentric'):
 
     return M
 
-def get_edges(F):
+def create_vertex_edge_map_sparse(E, num_vertices=None):
     """
-    Compute the unique undirected edges of a simplicial complex
-
+    Create a sparse matrix mapping vertices to their outgoing edge indices.
+    
     Parameters:
     -----------
-    F : ndarray
-        #F x simplex-size matrix of indices of simplex corners
-
+    E : ndarray
+        #E x 2 array of directed edges where each row contains [tail_vertex, tip_vertex]
+    num_vertices : int, optional
+        Number of vertices. If None, determined from max vertex index in E
+        
     Returns:
     --------
-    E : ndarray
-        Edges in sorted order, direction of each is also sorted
+    V2E : scipy.sparse.csr_matrix
+        Sparse matrix where each row i contains the outgoing edge indices for vertex i
+    """
+    # Generate edge indices first
+    edge_indices = np.arange(E.shape[1])
+    
+    # Create mask for non-self-loops
+    mask = E[0, :] != E[1, :]
+    
+    # Apply mask to both edges and their indices
+    E_filtered = E[:, mask]
+    edge_indices = edge_indices[mask]
+    
+    if num_vertices is None:
+        num_vertices = np.max(E) + 1
+    
+    # Create sparse matrix mapping vertices to edge indices
+    data = np.ones(len(edge_indices), dtype=np.bool_)
+    rows = E_filtered[0, :]  # tail vertices
+    cols = edge_indices
+    
+    return sparse.csr_matrix((data, (rows, cols)), 
+                           shape=(num_vertices, E.shape[1]))
 
-    Example:
+def process_vertex_batch(data: Tuple[np.ndarray, np.ndarray, np.ndarray, sparse.csr_matrix, int, float]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Process a batch of vertices to compute gradient operators.
+    
+    Parameters:
+    -----------
+    data : tuple
+        Contains (vertex_indices, edges, edge_vectors, neighbors_matrix, spacedim, eps_reg)
+    
+    Returns:
     --------
-    # get unique undirected edges
-    E = edges(F)
-    # get unique directed edges
-    E_directed = np.vstack((E, E[:, [1,0]]))
+    tuple
+        (row_indices, col_indices, values) for sparse matrix construction
     """
-    # Get all combinations of edges
-    n = F.shape[1]
-    # Generate all possible pairs of column indices
-    e = np.array([(i,j) for i in range(n) for j in range(i+1,n)])
+    vertex_indices, edges, edge_vectors, neighbors_matrix, spacedim, eps_reg = data
+    
+    batch_rows = []
+    batch_cols = []
+    batch_vals = []
+    I = np.eye(spacedim)
+    
+    for iV in vertex_indices:
+        # Get neighbors efficiently
+        neigh = neighbors_matrix.getrow(iV).nonzero()[1]
+        n_neigh = len(neigh)
+        
+        if n_neigh == 0:
+            continue
+            
+        # Build local matrices
+        lhs_mat = edge_vectors[neigh]
+        
+        # Build RHS matrix efficiently
+        rhs_mat = np.zeros((n_neigh, n_neigh + 1))
+        rhs_mat[:, 0] = -1
+        rhs_mat[np.arange(n_neigh), np.arange(n_neigh) + 1] = 1
+        
+        # Compute solution
+        lhs_T = lhs_mat.T
+        lhs_product = lhs_T @ lhs_mat
+        try:
+            lhs_inv = np.linalg.solve(lhs_product + eps_reg * I, lhs_T)
+            sol_mat = lhs_inv @ rhs_mat
+            
+            # Get vertex indices
+            ind_lookup = np.concatenate(([iV], edges[1, neigh]))
+            
+            # Store results
+            batch_rows.extend([iV] * (n_neigh + 1))
+            batch_cols.extend(ind_lookup)
+            batch_vals.extend(sol_mat.T)
+            
+        except np.linalg.LinAlgError:
+            continue
+    
+    return (np.array(batch_rows), np.array(batch_cols), np.array(batch_vals))
 
-    # Extract edges from F using the combinations
-    edge_start = F[:, e[:, 0]].flatten()
-    edge_end = F[:, e[:, 1]].flatten()
-
-    # Create sparse matrix
-    max_val = np.max(F)
-    A = sparse.csr_matrix((np.ones(len(edge_start)),
-                   (edge_start, edge_end)),
-                   shape=(max_val+1, max_val+1))
-
-    # Get lower triangular part of symmetric matrix
-    A = A + A.T
-    A = sparse.tril(A)
-
-    # Find non-zero elements
-    rows, cols = A.nonzero()
-
-    # Return edges with sorted columns
-    E = np.column_stack((cols, rows)).astype(np.int64)
-    return E
-
-def edge_vectors(verts, edges):
-    edge_vecs = verts[edges[1, :], :] - verts[edges[0, :], :]
-    return torch.tensor(edge_vecs)
-
-
-def build_grad(verts, edges, edge_vectors):
+def build_grad_parallel(verts: np.ndarray, 
+                       edges: np.ndarray, 
+                       edge_vectors: np.ndarray,
+                       batch_size: int = 1000,
+                       n_jobs: Optional[int] = None,
+                       eps_reg: float = 1e-5) -> List[sparse.csr_matrix]:
     """
-    Build a (V, V) complex sparse matrix grad operator. Given real inputs at vertices, produces a complex (vector value) at vertices giving the gradient.
-    All values pointwise.
-    - edges: (2, E)
+    Build gradient operator with parallelization and batch processing.
+    
+    Parameters:
+    -----------
+    verts : np.ndarray (V, spacedim)
+        Vertex positions
+    edges : np.ndarray (2, E)
+        Edge connectivity
+    edge_vectors : np.ndarray (E, spacedim)
+        Edge vectors
+    batch_size : int
+        Size of vertex batches for processing
+    n_jobs : int, optional
+        Number of parallel jobs. If None, uses CPU count
+    eps_reg : float
+        Regularization parameter
+        
+    Returns:
+    --------
+    List[sparse.csr_matrix]
+        List of sparse matrices for X, Y, Z components of gradient
     """
-  
-    # TODO find a way to do this in pure numpy?
-
-    # Build outgoing neighbor lists
     N = verts.shape[0]
     spacedim = verts.shape[1]
-
-    vert_edge_outgoing = [[] for i in range(N)]
-    for iE in range(edges.shape[1]):
-        tail_ind = edges[0, iE]
-        tip_ind = edges[1, iE]
-        if tip_ind != tail_ind:
-            vert_edge_outgoing[tail_ind].append(iE)
-
-    # Build local inversion matrix for each vertex
+    
+    # Get neighbor information
+    neighbors = create_vertex_edge_map_sparse(edges, N)
+    
+    # Create batches of vertices
+    vertex_batches = [
+        np.arange(i, min(i + batch_size, N))
+        for i in range(0, N, batch_size)
+    ]
+    
+    # Prepare data for parallel processing
+    process_data = [
+        (batch, edges, edge_vectors, neighbors, spacedim, eps_reg)
+        for batch in vertex_batches
+    ]
+    
+    # Process batches in parallel
+    if n_jobs != 1:
+        with Pool(processes=n_jobs) as pool:
+            results = pool.map(process_vertex_batch, process_data)
+    else:
+        results = map(process_vertex_batch, process_data)
+    
+    # Combine results
     row_inds = []
     col_inds = []
-    data_vals_X = []
-    data_vals_Y = []
-    data_vals_Z = []
-    eps_reg = 1e-5
-    for iV in range(N):
-        n_neigh = len(vert_edge_outgoing[iV])
+    data_vals = []
+    
+    for batch_rows, batch_cols, batch_vals in results:
+        if len(batch_rows) > 0:  # Only append if batch produced results
+            row_inds.append(batch_rows)
+            col_inds.append(batch_cols)
+            data_vals.append(batch_vals)
+    
+    row_inds = np.concatenate(row_inds)
+    col_inds = np.concatenate(col_inds)
+    data_vals = np.concatenate(data_vals)
+    
+    # Build sparse matrices for each component
+    matrices = []
+    for i in range(spacedim):
+        mat = sparse.coo_matrix(
+            (data_vals[:, i], (row_inds, col_inds)),
+            shape=(N, N)
+        ).tocsr()
+        matrices.append(mat)
+    
+    return matrices
 
-        lhs_mat = np.zeros((n_neigh, spacedim))
-        rhs_mat = np.zeros((n_neigh, n_neigh + 1))
-        ind_lookup = [iV]
-        for i_neigh in range(n_neigh):
-            iE = vert_edge_outgoing[iV][i_neigh]
-            jV = edges[1, iE]
-            ind_lookup.append(jV)
+def get_optimal_batch_size(N: int, avg_degree: float) -> int:
+    """
+    Determine optimal batch size based on problem size and average degree.
+    
+    Parameters:
+    -----------
+    N : int
+        Number of vertices
+    avg_degree : float
+        Average vertex degree
+        
+    Returns:
+    --------
+    int
+        Recommended batch size
+    """
+    # Simple heuristic based on problem size
+    if N < 1000:
+        return N  # Process all at once for small problems
+    elif N < 10000:
+        return 1000
+    else:
+        # For large problems, adjust based on average degree
+        return max(min(int(5000 / avg_degree), 5000), 100)
 
-            edge_vec = edge_vectors[iE][:]
-            w_e = 1.0
-
-            lhs_mat[i_neigh][:] = w_e * edge_vec
-            rhs_mat[i_neigh][0] = w_e * (-1)
-            rhs_mat[i_neigh][i_neigh + 1] = w_e * 1
-
-        lhs_T = lhs_mat.T
-        lhs_inv = np.linalg.inv(lhs_T @ lhs_mat + eps_reg * np.identity(spacedim)) @ lhs_T
-
-        sol_mat = lhs_inv @ rhs_mat
-        solX = sol_mat[0, :]
-        solY = sol_mat[1, :]
-        solZ = sol_mat[2, :]
-
-        for i_neigh in range(n_neigh + 1):
-            i_glob = ind_lookup[i_neigh]
-
-            row_inds.append(iV)
-            col_inds.append(i_glob)
-            data_vals_X.append(solX[i_neigh])
-            data_vals_Y.append(solY[i_neigh])
-            data_vals_Z.append(solZ[i_neigh])
-
-    # build the sparse matrix
-    row_inds = np.array(row_inds)
-    col_inds = np.array(col_inds)
-    data_vals_X = np.array(data_vals_X)
-    data_vals_Y = np.array(data_vals_Y)
-    data_vals_Z = np.array(data_vals_Z)
-    mat = [ sparse.coo_matrix((data_vals_X, (row_inds, col_inds)), shape=(N, N)).tocsr(),
-            sparse.coo_matrix((data_vals_Y, (row_inds, col_inds)), shape=(N, N)).tocsr(),
-            sparse.coo_matrix((data_vals_Z, (row_inds, col_inds)), shape=(N, N)).tocsr()]
-    return mat
-
-
-def compute_operators(verts, tets, k_eig=32, eig_solver='PINVIT'):
+def compute_operators(verts, tets, k_eig=32, eig_solver='LOBPCG'):
     """
     Builds spectral operators for a mesh. Constructs mass matrix, eigenvalues/vectors for Laplacian, and gradient matrix.
     See get_operators() for a similar routine that wraps this one with a layer of caching.
@@ -593,6 +670,7 @@ def compute_operators(verts, tets, k_eig=32, eig_solver='PINVIT'):
     """
     dtype = verts.dtype
     eps = 1e-8
+    
 
     # Build the scalar Laplacian
     # L, M = robust_laplacian.mesh_laplacian(verts_np, faces_np)
@@ -600,78 +678,58 @@ def compute_operators(verts, tets, k_eig=32, eig_solver='PINVIT'):
     L = (-1.0) * cotmatrix(verts, tets)
     massvec = massmatrix(verts, tets).diagonal()
     massvec += eps * np.mean(massvec)
+    diag_shift = eps * sparse.identity(L.shape[0])
 
     if np.isnan(L.data).any():
         raise RuntimeError("NaN Laplace matrix")
-    if np.isnan(massvec_np).any():
+    if np.isnan(massvec).any():
         raise RuntimeError("NaN mass matrix")
 
     # Read off neighbors & rotations from the Laplacian
     L_coo = L.tocoo()
     inds_row = L_coo.row
     inds_col = L_coo.col
-
+    
     # === Compute the eigenbasis
     if k_eig > 0:
 
         # Prepare matrices
-        L_eigsh = (L + sparse.identity(L.shape[0]) * eps)
-        massvec_eigsh = massvec
-        Mmat = sparse.diags(massvec_eigsh)
-        eigs_sigma = eps
-
-        failcount = 0
-        while True:
-            try:
-                # We would be happy here to lower tol or maxiter since we don't need these to be super precise,
-                # but for some reason those parameters seem to have no effect
-
-                # build an AMG prec for LOBPCG solver
-                B = np.ones((L_eigsh.shape[0], 1))
-                ml = pyamg.smoothed_aggregation_solver(L_eigsh , B)
-                Mp = ml.aspreconditioner()
-                
-                if eig_solver == 'PINVIT':
-                    evals, evecs = PINVIT(L_eigsh, Mmat, Mp, k_eig)
-                    evecs = evecs_np.T
-                else:
-                    # compute eigenvalues and eigenvectors with LOBPCG
-                    # initial approximation to the K eigenvectors
-                    rng = np.random.default_rng(seed=42)
-                    X = rng.standard_normal((L_eigsh.shape[0], k_eig))
-                    # preconditioner based on ml    
-                    evals, evecs = sparse.linalg.lobpcg(L_eigsh, X, M=Mp, B=Mmat, largest=False, maxiter=50)
-                # Clip off any eigenvalues that end up slightly negative due to numerical weirdness
-                evals = np.clip(evals, a_min=0.0, a_max=float("inf"))
-                
-
-                break
-            except Exception as e:
-                print(e)
-                if failcount > 3:
-                    raise ValueError("failed to compute eigendecomp")
-                failcount += 1
-                print("--- decomp failed; adding eps ===> count: " + str(failcount))
-                L_eigsh = L_eigsh + sparse.identity(L.shape[0]) * (
-                    eps * 10 ** failcount
-                )
-
+        L += diag_shift
+        Mmat = sparse.diags(massvec)
+        B = np.ones((L.shape[0], 1))
+        ml = pyamg.smoothed_aggregation_solver(L,B)
+        Mp = ml.aspreconditioner()
+        if eig_solver == 'PINVIT':
+            evals, evecs = PINVIT(L, Mmat, Mp, k_eig)
+            evecs = evecs.T
+        else:
+            # compute eigenvalues and eigenvectors with LOBPCG
+            # initial approximation to the K eigenvectors
+            rng = np.random.default_rng(seed=42)
+            X = rng.standard_normal((L.shape[0], k_eig))
+            # preconditioner based on ml    
+            evals, evecs = sparse.linalg.lobpcg(L, X, M=Mp, B=Mmat, largest=False, maxiter=50)
+        evals = np.clip(evals, a_min=0.0, a_max=float("inf"))
     else:  # k_eig == 0
         evals = np.zeros((0))
         evecs = np.zeros((verts.shape[0], 0))
-
+    print(evecs[0])
     # == Build gradient matrices
 
-    # For meshes, we use the same edges as were used to build the Laplacian. For point clouds, use a whole local neighborhood
+    # For meshes, we use the same edges as were used to build the Laplacian
     edges = np.stack((inds_row, inds_col), axis=0)
     edge_vecs = verts[edges[1, :], :] - verts[edges[0, :], :]
-    grads = build_grad(verts, edges, edge_vecs)
+
+    # Advanced usage with all options
+    avg_degree = edges.shape[1] / verts.shape[0]
+    batch_size = get_optimal_batch_size(verts.shape[0], avg_degree)
+    grads = build_grad_parallel(verts, edges, edge_vecs, batch_size=batch_size)
     gradX = grads[0]
     gradY = grads[1]
     gradZ = grads[2]
 
     # === Convert back to torch
-    return evals, evecs, gradX, gradY, gradZ
+    return massvec, evals, evecs, gradX, gradY, gradZ
 
 
 def get_all_operators(verts_list, tets_list, k_eig, op_cache_dir=None):
@@ -919,7 +977,7 @@ def compute_hks(evals, evecs, scales): #numpy
         expand_batch = False
 
     # TODO could be a matmul
-    power_coefs = np.exapnd_dims(np.exp(-np.expand_dims(evals, axis=1) * np.expand_dims(scales, axis=-1)), axis=1) # (B,1,S,K)
+    power_coefs = np.expand_dims(np.exp(-np.expand_dims(evals, axis=1) * np.expand_dims(scales, axis=-1)), axis=1) # (B,1,S,K)
     terms = power_coefs * np.expand_dims((evecs * evecs), axis=2)  # (B,V,S,K)
 
     out = np.sum(terms, axis=-1)  # (B,V,S)
@@ -932,7 +990,7 @@ def compute_hks(evals, evecs, scales): #numpy
 
 def compute_hks_autoscale(evals, evecs, count): # numpy
     # these scales roughly approximate those suggested in the hks paper
-    scales = np.logspace(-2, 0.0, steps=count)
+    scales = np.logspace(-2, 0.0, num=count)
     return compute_hks(evals, evecs, scales)
 
 #numpy version
@@ -944,14 +1002,14 @@ def normalize_positions(pos, method="mean"):
         pos = pos - np.mean(pos, axis=-2, keepdims=True)
     elif method == "bbox":
         # center via the middle of the axis-aligned bounding box
-        bbox_min = np.min(pos, dim=-2)
-        bbox_max = np.max(pos, dim=-2)
+        bbox_min = np.min(pos, axis=-2)
+        bbox_max = np.max(pos, axis=-2)
         center = (bbox_max + bbox_min) / 2.0
         pos -= np.expand_dims(center, axis=-2)
     else:
         raise ValueError("unrecognized method")
 
-    scale = np.expand_dims(np.max(np.linalg.norm(pos, axis=len(pos.shape)-1), dim=-1, keepdims=True), axis=-1)
+    scale = np.expand_dims(np.max(np.linalg.norm(pos, axis=len(pos.shape)-1), axis=-1, keepdims=True), axis=-1)
     pos = pos / scale
     return pos
 
@@ -1065,7 +1123,7 @@ def normalize_volume_scale(verts, tets):
     vec_A = coords[:, 1, :] - coords[:, 0, :]
     vec_B = coords[:, 2, :] - coords[:, 0, :]
     vec_C = coords[:, 3, :] - coords[:, 0, :]
-    tet_vols = np.abs(np.einsum('ij,ij->i', cross(vec_A, vec_B, axis=-1), vec_C)) / 6.
+    tet_vols = np.abs(np.einsum('ij,ij->i', np.cross(vec_A, vec_B, axis=-1), vec_C)) / 6.
     total_vol = np.sum(tet_vols)
     # scale
     scale = total_vol ** (-1. / 3.)
