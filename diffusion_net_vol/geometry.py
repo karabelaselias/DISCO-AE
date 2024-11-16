@@ -622,6 +622,140 @@ def build_grad_parallel(verts: np.ndarray,
     
     return matrices
 
+def process_vertex_batch_v2(data: Tuple[np.ndarray, np.ndarray, np.ndarray, sparse.csr_matrix, int, float]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Process a batch of vertices to compute gradient operators.
+    
+    Parameters:
+    -----------
+    data : tuple
+        Contains (vertex_indices, edges, edge_vectors, neighbors_matrix, spacedim, eps_reg)
+    
+    Returns:
+    --------
+    tuple
+        (row_indices, col_indices, values) for sparse matrix construction
+    """
+    vertex_indices, edges, edge_vectors, neighbors_matrix, spacedim, eps_reg = data
+    
+    batch_rows = []
+    batch_cols = []
+    batch_vals = []
+    I = np.eye(spacedim)
+    
+    for iV in vertex_indices:
+        # Get neighbors efficiently
+        neigh = neighbors_matrix.getrow(iV).nonzero()[1]
+        n_neigh = len(neigh)
+        
+        if n_neigh == 0:
+            continue
+            
+        # Build local matrices
+        lhs_mat = edge_vectors[neigh]
+        
+        # Build RHS matrix efficiently
+        rhs_mat = np.zeros((n_neigh, n_neigh + 1))
+        rhs_mat[:, 0] = -1
+        rhs_mat[np.arange(n_neigh), np.arange(n_neigh) + 1] = 1
+        
+        # Compute solution
+        lhs_T = lhs_mat.T
+        lhs_product = lhs_T @ lhs_mat
+        try:
+            lhs_inv = np.linalg.solve(lhs_product + eps_reg * I, lhs_T)
+            sol_mat = lhs_inv @ rhs_mat
+            
+            # Get vertex indices
+            ind_lookup = np.concatenate(([iV], edges[1, neigh]))
+            
+            # For each component (x,y,z), store with appropriate row offset
+            for d in range(spacedim):
+                batch_rows.extend([iV + d * neighbors_matrix.shape[0]] * (n_neigh + 1))
+                batch_cols.extend(ind_lookup)
+                batch_vals.extend(sol_mat[d])
+            
+        except np.linalg.LinAlgError:
+            continue
+    
+    return (np.array(batch_rows), np.array(batch_cols), np.array(batch_vals))
+
+def build_grad_parallel_single(verts: np.ndarray, 
+                             edges: np.ndarray, 
+                             edge_vectors: np.ndarray,
+                             batch_size: int = 1000,
+                             n_jobs: Optional[int] = None,
+                             eps_reg: float = 1e-5) -> sparse.spmatrix:
+    """
+    Build gradient operator with parallelization and batch processing,
+    returning a single sparse matrix of shape (3N x N).
+    
+    Parameters:
+    -----------
+    verts : np.ndarray (V, 3)
+        Vertex positions
+    edges : np.ndarray (2, E)
+        Edge connectivity
+    edge_vectors : np.ndarray (E, 3)
+        Edge vectors
+    batch_size : int
+        Size of vertex batches for processing
+    n_jobs : int, optional
+        Number of parallel jobs. If None, uses CPU count
+    eps_reg : float
+        Regularization parameter
+        
+    Returns:
+    --------
+    sparse.spmatrix (3N, N)
+        Gradient operator as a single sparse matrix
+    """
+    N = verts.shape[0]
+    spacedim = verts.shape[1]
+    
+    # Get neighbor information
+    neighbors = create_vertex_edge_map_sparse(edges, N)
+    
+    # Create batches of vertices
+    vertex_batches = [
+        np.arange(i, min(i + batch_size, N))
+        for i in range(0, N, batch_size)
+    ]
+    
+    # Prepare data for parallel processing
+    process_data = [
+        (batch, edges, edge_vectors, neighbors, spacedim, eps_reg)
+        for batch in vertex_batches
+    ]
+    
+    # Process batches in parallel
+    if n_jobs != 1:
+        with Pool(processes=n_jobs) as pool:
+            results = pool.map(process_vertex_batch_v2, process_data)
+    else:
+        results = map(process_vertex_batch_v2, process_data)
+    
+    # Combine results
+    row_inds = []
+    col_inds = []
+    data_vals = []
+    
+    for batch_rows, batch_cols, batch_vals in results:
+        if len(batch_rows) > 0:  # Only append if batch produced results
+            row_inds.append(batch_rows)
+            col_inds.append(batch_cols)
+            data_vals.append(batch_vals)
+    
+    row_inds = np.concatenate(row_inds)
+    col_inds = np.concatenate(col_inds)
+    data_vals = np.concatenate(data_vals)
+    
+    # Create single sparse matrix
+    mat = sparse.coo_matrix((data_vals, (row_inds, col_inds)), 
+                           shape=(3*N, N))
+    
+    return mat.tocsr()
+
 def get_optimal_batch_size(N: int, avg_degree: float) -> int:
     """
     Determine optimal batch size based on problem size and average degree.
@@ -662,9 +796,7 @@ def compute_operators(verts, tets, k_eig=32, eig_solver='LOBPCG'):
       - L: (VxV) real sparse matrix of (weak) Laplacian
       - evals: (k) list of eigenvalues of the Laplacian
       - evecs: (V,k) list of eigenvectors of the Laplacian
-      - gradX: (VxV) sparse matrix which gives X-component of gradient in the local basis at the vertex
-      - gradY: same as gradX but for Y-component of gradient
-      - gradZ: same as gradX but for Z-component of gradient
+      - gradMat: (3*VxV) sparse matrix which gives gradient in the local basis at the vertex
     Note: for a generalized eigenvalue problem, the mass matrix matters! The eigenvectors are only othrthonormal with respect to the mass matrix,
     like v^H M v, so the mass (given as the diagonal vector massvec) needs to be used in projections, etc.
     """
@@ -713,7 +845,6 @@ def compute_operators(verts, tets, k_eig=32, eig_solver='LOBPCG'):
     else:  # k_eig == 0
         evals = np.zeros((0))
         evecs = np.zeros((verts.shape[0], 0))
-    print(evecs[0])
     # == Build gradient matrices
 
     # For meshes, we use the same edges as were used to build the Laplacian
@@ -723,13 +854,9 @@ def compute_operators(verts, tets, k_eig=32, eig_solver='LOBPCG'):
     # Advanced usage with all options
     avg_degree = edges.shape[1] / verts.shape[0]
     batch_size = get_optimal_batch_size(verts.shape[0], avg_degree)
-    grads = build_grad_parallel(verts, edges, edge_vecs, batch_size=batch_size)
-    gradX = grads[0]
-    gradY = grads[1]
-    gradZ = grads[2]
-
+    gradMat = build_grad_parallel_single(verts, edges, edge_vecs, batch_size=batch_size)
     # === Convert back to torch
-    return massvec, evals, evecs, gradX, gradY, gradZ
+    return massvec, evals, evecs, gradMat
 
 
 def get_all_operators(verts_list, tets_list, k_eig, op_cache_dir=None):

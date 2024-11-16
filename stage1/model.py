@@ -30,7 +30,7 @@ class RegularizedFMNet(nn.Module):
         A_t = A.transpose(1, 2)
         A_A_t = torch.bmm(A, A_t)
         B_A_t = torch.bmm(B, A_t)
-
+        
         C_i = []
         for i in range(evals_x.size(1)):
             D_i = torch.cat([torch.diag(D[bs, i, :].flatten()).unsqueeze(0) for bs in range(evals_x.size(0))], dim=0)
@@ -70,24 +70,28 @@ class GeomFMapNet(nn.Module):
         self.n_fmap = cfg["fmap"]["n_fmap"]
 
     def forward(self, batch):
-        verts1, tets1, mass1, evals1, evecs1, gradX1, gradY1, gradZ1 = (batch["shape1"]["xyz"], batch["shape1"]["tets"],
+        verts1, tets1, mass1, evals1, evecs1, grad1 = (batch["shape1"]["xyz"], batch["shape1"]["tets"],
                                                                      batch["shape1"]["mass"], batch["shape1"]["evals"], batch["shape1"]["evecs"],
-                                                                     batch["shape1"]["gradX"], batch["shape1"]["gradY"],batch["shape1"]["gradZ"])
-        verts2, tets2, mass2, evals2, evecs2, gradX2, gradY2, gradZ2 = (batch["shape2"]["xyz"], batch["shape2"]["tets"],
+                                                                     batch["shape1"]["grad"])
+        verts2, tets2, mass2, evals2, evecs2, grad2 = (batch["shape2"]["xyz"], batch["shape2"]["tets"],
                                                                      batch["shape2"]["mass"],
                                                                      batch["shape2"]["evals"], batch["shape2"]["evecs"],
-                                                                     batch["shape2"]["gradX"], batch["shape2"]["gradY"], batch["shape2"]["gradZ"])
+                                                                     batch["shape2"]["grad"])
 
         # set features to vertices
         features1, features2 = verts1, verts2
 
         feat1 = self.feature_extractor(features1, mass1, evals=evals1, evecs=evecs1,
-                                       gradX=gradX1, gradY=gradY1, gradZ=gradZ1, faces=tets1).unsqueeze(0)
+                                       grad=grad1, faces=tets1).unsqueeze(0)
         feat2 = self.feature_extractor(features2, mass2, evals=evals2, evecs=evecs2,
-                                       gradX=gradX2, gradY=gradY2, gradZ=gradZ2, faces=tets2).unsqueeze(0)
-
+                                       grad=grad2, faces=tets2).unsqueeze(0)
+        
         # predict fmap
-        evecs_trans1, evecs_trans2 = evecs1.t()[:self.n_fmap] @ torch.diag(mass1), evecs2.t()[:self.n_fmap] @ torch.diag(mass2)
+        # this might be just a simple scaling
+        # evecs1.t has [n_fmap, nnodes], mass1 is a diagonal vector with nnodes
+        evecs_trans1 = torch.einsum('bi,i->bi',evecs1.t()[:self.n_fmap] , mass1)
+        evecs_trans2 = torch.einsum('bi,i->bi',evecs2.t()[:self.n_fmap] , mass2)
+        #evecs_trans1, evecs_trans2 = evecs1.t()[:self.n_fmap] @ torch.diag(mass1), evecs2.t()[:self.n_fmap] @ torch.diag(mass2)
         evals1, evals2 = evals1[:self.n_fmap], evals2[:self.n_fmap]
         #
         C12 = self.fmreg_net(feat1, feat2, evals1, evals2, evecs_trans1, evecs_trans2)

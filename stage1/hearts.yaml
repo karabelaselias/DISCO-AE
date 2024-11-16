@@ -1,0 +1,42 @@
+# dataset params
+dataset:
+  name: hearts
+  root_train: ../data/Data_Hearts
+  root_test: ../data/Data_Hearts
+  cache_dir: ../data/Data_Hearts/op_cache
+
+
+
+# optimizer params
+optimizer:
+  lr: 1e-3
+  b1: 0.9
+  b2: 0.99
+  decay_iter: 3
+  decay_factor: 0.5
+
+training:
+  batch_size: 4
+  epochs: 5
+
+# fmap module params
+fmap:
+  n_fmap: 30  # number of eigenvectors used for fmap
+  k_eig: 64  # number of eigenvectors used for diffusion
+  n_feat: 64
+  C_in: 3
+  lambda_: 100
+  resolvant_gamma: 0.5
+  robust: False
+
+# loss params
+loss:
+  w_bij: 1
+  w_ortho: 1
+
+# misc
+misc:
+  cuda: False
+  device: 0
+  checkpoint_interval: 1
+  log_interval: 2

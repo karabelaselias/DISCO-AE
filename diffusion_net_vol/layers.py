@@ -19,8 +19,6 @@ class LearnedTimeDiffusion(nn.Module):
         super(LearnedTimeDiffusion, self).__init__()
         self.C_inout = C_inout
         self.diffusion_time = nn.Parameter(torch.Tensor(C_inout))  # (C)
-        self.method = method  # one of ['spectral', 'implicit_dense']
-
         nn.init.constant_(self.diffusion_time, 0.0)
 
     def forward(self, x, mass, evals, evecs):
@@ -157,7 +155,7 @@ class DiffusionNetBlock(nn.Module):
             [self.MLP_C] + self.mlp_hidden_dims + [self.C_width], dropout=self.dropout
         )
 
-    def forward(self, x_in, mass, evals, evecs, gradX, gradY, gradZ):
+    def forward(self, x_in, mass, evals, evecs, grad):
 
         # Manage dimensions
         B = x_in.shape[0]  # batch dimension
@@ -175,17 +173,8 @@ class DiffusionNetBlock(nn.Module):
         if self.with_gradient_features:
 
             # Compute gradients
-            x_grads = (
-                []
-            )  # Manually loop over the batch (if there is a batch dimension) since torch.mm() doesn't support batching
-            for b in range(B):
-                # gradient after diffusion
-                x_gradX = torch.mm(gradX[b, ...], x_diffuse[b, ...])
-                x_gradY = torch.mm(gradY[b, ...], x_diffuse[b, ...])
-                x_gradZ = torch.mm(gradZ[b, ...], x_diffuse[b, ...])
-                x_grads.append(torch.stack((x_gradX, x_gradY, x_gradZ), dim=-1))
-            x_grad = torch.stack(x_grads, dim=0)
-
+            x_grad = torch.bmm(grad, x_diffuse).reshape(B, -1, self.C_width, 3)
+            
             # Evaluate gradient features
             x_grad_features = self.gradient_features(x_grad)
 
@@ -289,9 +278,7 @@ class DiffusionNet(nn.Module):
         mass, 
         evals=None,
         evecs=None,
-        gradX=None,
-        gradY=None,
-        gradZ=None,
+        grad=None,
         edges=None,
         faces=None,
     ):
@@ -310,8 +297,7 @@ class DiffusionNet(nn.Module):
             x_in (tensor):      Input features, dimension [N,C] or [B,N,C]
             evals (tensor):     Eigenvalues of Laplace matrix, dimension [K_EIG] or [B,K_EIG]
             evecs (tensor):     Eigenvectors of Laplace matrix, dimension [N,K_EIG] or [B,N,K_EIG]
-            gradX (tensor):     Half of gradient matrix, sparse real tensor with dimension [N,N] or [B,N,N]
-            gradY (tensor):     Half of gradient matrix, sparse real tensor with dimension [N,N] or [B,N,N]
+            grad (tensor):      Gradient matrix, sparse real tensor with dimension [N,N] or [B,N,N]
         Returns:
             x_out (tensor):    Output with dimension [N,C_out] or [B,N,C_out]
         """
@@ -334,12 +320,8 @@ class DiffusionNet(nn.Module):
                 evals = evals.unsqueeze(0)
             if evecs is not None:
                 evecs = evecs.unsqueeze(0)
-            if gradX is not None:
-                gradX = gradX.unsqueeze(0)
-            if gradY is not None:
-                gradY = gradY.unsqueeze(0)
-            if gradZ is not None:
-                gradZ = gradZ.unsqueeze(0)
+            if grad is not None:
+                grad = grad.unsqueeze(0)
             if edges is not None:
                 edges = edges.unsqueeze(0)
             if faces is not None:
@@ -356,7 +338,7 @@ class DiffusionNet(nn.Module):
 
         # Apply each of the blocks
         for b in self.blocks:
-            x = b(x, mass, evals, evecs, gradX, gradY, gradZ)
+            x = b(x, mass, evals, evecs, grad)
 
         # Apply the last linear layer
         x = self.last_lin(x)

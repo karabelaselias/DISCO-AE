@@ -30,9 +30,7 @@ class HeartDataset(Dataset):
         self.massvec_list = []
         self.evals_list = []
         self.evecs_list = []
-        self.gradX_list = []
-        self.gradY_list = []
-        self.gradZ_list = []
+        self.grad_list = []
         self.hks_list = []
 
         # set combinations
@@ -82,16 +80,11 @@ class HeartDataset(Dataset):
                     self.hks_list.append(torch.from_numpy(npzfile["hks"]))
                     self.evals_list.append(torch.from_numpy(npzfile["evals"]))
                     self.evecs_list.append(torch.from_numpy(npzfile["evecs"]))
-                    def read_sp_mat(prefix):
-                        data = npzfile[prefix + "_data"]
-                        indices = npzfile[prefix + "_indices"]
-                        indptr = npzfile[prefix + "_indptr"]
-                        shape = npzfile[prefix + "_shape"]
-                        mat = scipy.sparse.csr_matrix((data, indices, indptr), shape=shape).astype(np.float32)
-                        return diffusion_net_vol.utils.sparse_np_to_torch(mat)
-                    self.gradX_list.append(read_sp_mat("gradX"))
-                    self.gradY_list.append(read_sp_mat("gradY"))
-                    self.gradZ_list.append(read_sp_mat("gradZ"))
+                    data = npzfile["grad_data"]
+                    indices = npzfile["grad_indices"]
+                    indptr = npzfile["grad_indptr"]
+                    mat = scipy.sparse.csr_matrix((data, indices, indptr))
+                    self.grad_list.append(diffusion_net_vol.utils.sparse_np_to_torch(mat).coalesce())
                     continue
                 print("  --> dataset not in cache, repopulating")
                 
@@ -101,35 +94,20 @@ class HeartDataset(Dataset):
             
             # center and unit scale
             verts = np.ascontiguousarray(verts)
-            tets  = np.ascontiguousarray(test)
+            tets  = np.ascontiguousarray(tets)
             
             verts = diffusion_net_vol.geometry.normalize_positions(verts)
 
             # normalize area
             verts = diffusion_net_vol.geometry.normalize_volume_scale(verts, tets)
-            mass, evals, evecs, gradX, gradY, gradZ = diffusion_net_vol.geometry.compute_operators(verts, tets, k_eig=k_eig)
+            mass, evals, evecs, gradMat = diffusion_net_vol.geometry.compute_operators(verts, tets, k_eig=k_eig)
 
             # hks
             hks = diffusion_net_vol.geometry.compute_hks_autoscale(evals, evecs, 16)
 
-            verts = torch.tensor(verts).float()
-            
-            self.massvec_list.append(torch.from_numpy(mass).to(device=device, dtype=verts.dtype))
-            self.evals_list.append(torch.from_numpy(evals).to(device=device, dtype=verts.dtype))
-            self.evecs_list.append(torch.from_numpy(evecs).to(device=device, dtype=verts.dtype))
-            self.gradX_list.append(diffusion_net_vol.utils.sparse_np_to_torch(gradX).to(device=device, dtype=verts.dtype))
-            self.gradY_list.append(diffusion_net_vol.utils.sparse_np_to_torch(gradY).to(device=device, dtype=verts.dtype))
-            self.gradZ_list.append(diffusion_net_vol.utils.sparse_np_to_torch(gradZ).to(device=device, dtype=verts.dtype))
-            self.hks_list.append(torch.from_numpy(hks).to(device=device, dtype=verts.dtype))
-            self.verts_list.append(verts)
-            self.tets_list.append(torch.tensor(tets))
-            self.names_list.append(os.path.basename(mfile))
-            
             # save stuff
-            gradX32 = gradX.astype(dtype_np)
-            gradY32 = gradY.astype(dtype_np)
-            gradZ32 = gradZ.astype(dtype_np)
-
+            gradMat32 = gradMat.astype(dtype_np)
+            
             np.savez(
                 cfile,
                 name=os.path.basename(mfile),
@@ -140,19 +118,22 @@ class HeartDataset(Dataset):
                 hks=hks.astype(dtype_np),
                 evals=evals.astype(dtype_np),
                 evecs=evecs.astype(dtype_np),
-                gradX_data=gradX32.data,
-                gradX_indices=gradX32.indices,
-                gradX_indptr=gradX32.indptr,
-                gradX_shape=gradX32.shape,
-                gradY_data=gradY32.data,
-                gradY_indices=gradY32.indices,
-                gradY_indptr=gradY32.indptr,
-                gradY_shape=gradY32.shape,
-                gradZ_data=gradZ32.data,
-                gradZ_indices=gradZ32.indices,
-                gradZ_indptr=gradZ32.indptr,
-                gradZ_shape=gradZ32.shape,
+                grad_data=gradMat32.data,
+                grad_indices=gradMat32.indices,
+                grad_indptr=gradMat32.indptr
             )
+            
+            verts = torch.tensor(verts).float()  
+            self.massvec_list.append(torch.from_numpy(mass).to(device=device, dtype=verts.dtype))
+            self.evals_list.append(torch.from_numpy(evals).to(device=device, dtype=verts.dtype))
+            self.evecs_list.append(torch.from_numpy(evecs).to(device=device, dtype=verts.dtype))
+            self.grad_list.append(diffusion_net_vol.utils.sparse_np_to_torch(gradMat).coalesce().to(device=device, dtype=verts.dtype))
+            self.hks_list.append(torch.from_numpy(hks).to(device=device, dtype=verts.dtype))
+            self.verts_list.append(verts)
+            self.tets_list.append(torch.tensor(tets))
+            self.names_list.append(os.path.basename(mfile))
+            
+
 
     def __len__(self):
         return len(self.combinations)
@@ -166,9 +147,7 @@ class HeartDataset(Dataset):
             "mass": self.massvec_list[idx1],
             "evals": self.evals_list[idx1],
             "evecs": self.evecs_list[idx1],
-            "gradX": self.gradX_list[idx1],
-            "gradY": self.gradY_list[idx1],
-            "gradZ": self.gradZ_list[idx1],
+            "grad": self.grad_list[idx1],
             "name": self.names_list[idx1]
         }
 
@@ -178,9 +157,7 @@ class HeartDataset(Dataset):
             "mass": self.massvec_list[idx2],
             "evals": self.evals_list[idx2],
             "evecs": self.evecs_list[idx2],
-            "gradX": self.gradX_list[idx2],
-            "gradY": self.gradY_list[idx2],
-            "gradZ": self.gradZ_list[idx2],
+            "grad": self.grad_list[idx2],
             "name": self.names_list[idx2]
         }
 
@@ -188,7 +165,7 @@ class HeartDataset(Dataset):
 
 
 def shape_to_device(dict_shape, device):
-    names_to_device = ["xyz", "tets", "mass", "evals", "evecs", "gradX", "gradY", "gradZ"]
+    names_to_device = ["xyz", "tets", "mass", "evals", "evecs", "grad"]
     for k, v in dict_shape.items():
         if "shape" in k:
             for name in names_to_device:

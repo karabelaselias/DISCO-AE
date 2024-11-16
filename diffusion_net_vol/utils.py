@@ -60,6 +60,18 @@ def sparse_np_to_torch(A):
     shape = Acoo.shape
     return torch.sparse_coo_tensor(torch.LongTensor(indices), torch.FloatTensor(values), torch.Size(shape)).coalesce()
 
+# Numpy csr sparse matrix to pytorch csr
+def sparse_csr_np_to_torch_csr(A):
+    return torch.sparse_csr_tensor(A.indptr, A.indices, A.data)
+
+def sparse_torch_csr_to_np_csr(A):
+    if len(A.shape) != 2:
+        raise RuntimeError("should be a matrix-shaped type; dim is : " + str(A.shape))
+    indptr = toNP(A.crow_indices())
+    indices = toNP(A.col_indices())
+    values = toNP(A.values())
+    return scipy.sparse.csr_matrix((values, indices, indptr))
+
 # Pytorch sparse to numpy csc matrix
 def sparse_torch_to_np(A):
     if len(A.shape) != 2:
